@@ -5,8 +5,14 @@ use std::sync::Arc;
 use std::{fs, io};
 
 use cookie_store::CookieStore;
-use reqwest::Client;
+use rand::seq::SliceRandom;
+use reqwest::header::{ORIGIN, REFERER};
+use reqwest::multipart::{Form, Part};
+use reqwest::{Client, Proxy};
 use reqwest_cookie_store::CookieStoreRwLock;
+
+use self::data::AlbumUploadRsp;
+use self::url::{ALBUM_UPLOAD_URL, FEED_DOMAIN, WWW};
 
 use self::data::{LoginQrRsp, QrRsp, SelfInfoRsp};
 use self::url::{BASIC_INFO_GET_URL, LOGIN_QRCODE_GET_WEB_URL, LOGIN_WEB_QRCODE_URL};
@@ -52,6 +58,17 @@ impl BiliClient {
       reqwest: client,
       cookie_path: path,
       cookie: Arc::clone(&cookie_store),
+    }
+  }
+
+  async fn get_csrf(&self) -> Result<String, GetCsrfError> {
+    let arc = Arc::clone(&self.cookie);
+    let lock = &arc.read().map_err(|_| GetCsrfError::LockPoison())?;
+    let cookie = lock.get("bilibili.com", "/", "bili_jct");
+    if let Some(csrf) = cookie.map(|i| String::from(i.value())) {
+      Ok(csrf)
+    } else {
+      Err(GetCsrfError::NotLogin())
     }
   }
 
@@ -101,6 +118,38 @@ impl BiliClient {
   }
 
   // endregion ======= Info ======= //
+
+  // region ======= Upload =======
+
+  async fn upload_image_via_album(
+    &self,
+    init_part: Part,
+  ) -> Result<AlbumUploadRsp, AlbumUploadError> {
+    let rsp = self
+      .reqwest
+      .post(ALBUM_UPLOAD_URL)
+      .header(REFERER, FEED_DOMAIN)
+      .header(ORIGIN, FEED_DOMAIN)
+      .multipart(
+        Form::new()
+          .part(
+            "file_up",
+            init_part
+              .mime_str("image/*")
+              .unwrap()
+              .file_name(*QUOTES.choose(&mut rand::thread_rng()).unwrap()),
+          )
+          .text("biz", "new_dyn")
+          .text("category", "daily")
+          .text("csrf", self.get_csrf().await?),
+      )
+      .send()
+      .await?;
+    let rsp: AlbumUploadRsp = rsp.json().await?;
+    Ok(rsp)
+  }
+
+  // endregion ======= Upload ======= //
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -118,12 +167,47 @@ pub enum LoginQrError {
   #[error("The oauth_key of QrRsp is None")]
   NoneOauthKey,
   #[error("A network error occurred {0}")]
-  Network(reqwest::Error),
+  Network(#[from] reqwest::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum GetCsrfError {
+  #[error("Mutex lock poisoned")]
+  LockPoison(),
+  #[error("Not login, no bili_jct value")]
+  NotLogin(),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AlbumUploadError {
+  #[error("Invalid csrf")]
+  Csrf(#[from] GetCsrfError),
+  #[error("A network error occurred {0}")]
+  Network(#[from] reqwest::Error),
 }
 
 #[cfg(test)]
 mod tests {
+  use reqwest::multipart::Part;
+
+  use crate::drivers::bili::GetCsrfError;
+  use crate::encoder::Encoder;
+
   use super::BiliClient;
+
+  #[tokio::test]
+  async fn get_csrf_test() {
+    let bili_cli = BiliClient::new().await;
+    match bili_cli.get_csrf().await {
+      Ok(cookie) => {
+        dbg!(cookie);
+      }
+      Err(err) => match err {
+        GetCsrfError::NotLogin() => println!("Not login!"),
+        _ => Err(err).unwrap(),
+      },
+    };
+  }
 
   #[tokio::test]
   async fn get_login_qr_test() {
@@ -132,8 +216,7 @@ mod tests {
   }
 
   #[tokio::test]
-  #[allow(unreachable_code)]
-  async fn qr_code_login() {
+  async fn qr_code_login_test() {
     if option_env!("RUN_MANUALLY") != Some("true") {
       return;
     }
@@ -146,10 +229,37 @@ mod tests {
   }
 
   #[tokio::test]
-  #[allow(unreachable_code)]
-  async fn get_self_info() {
+  async fn get_self_info_test() {
     let bili_cli = BiliClient::new().await;
     let rsp = bili_cli.get_self_info().await.unwrap();
     dbg!(rsp);
   }
+
+  #[tokio::test]
+  async fn upload_image_via_album_test() {
+    let bili_cli = BiliClient::new().await;
+    let enc = crate::encoder::png::PngEncoder();
+    let encoded = enc.encode(&[80; 114514]).unwrap();
+    let rsp = bili_cli
+      .upload_image_via_album(Part::bytes(encoded))
+      .await
+      .unwrap();
+    dbg!(rsp);
+  }
 }
+
+const QUOTES: [&str; 13] = [
+  "叔叔我啊，真的要生气了",
+  "你所热爱的，就是你的生活",
+  "你妈什么时候死啊?",
+  "我没改变B站",
+  "LV4会员每年将免费获得3个月的“大会员”",
+  "LV5会员每年将免费获得6个月的“大会员”",
+  "LV6会员每年将免费获得9个月的“大会员",
+  "B站未来有可能会倒闭，但绝不会变质",
+  "资本把周宇翔变成了鬼",
+  "汉奸是因利益而产生的，和过去或现在无关",
+  "我没改变B站",
+  "2021年准备让b站市值翻几倍?",
+  "诶哟哟，我一般是不看市值，最重要的是用户满意度",
+];

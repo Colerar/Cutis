@@ -249,7 +249,7 @@ pub(super) const FAVORITES_MEDIA_GET_URL: &str = "https://api.bilibili.com/x/v3/
 
 pub(super) const ALBUM_INFO_GET_URL: &str = "https://api.vc.bilibili.com/link_draw/v1/doc/detail";
 
-pub(super) const ALBUM_UPLOAD_URL: &str = "https://api.vc.bilibili.com/api/v1/drawImage/upload";
+pub(super) const ALBUM_UPLOAD_URL: &str = "https://api.bilibili.com/x/dynamic/feed/draw/upload_bfs";
 
 // endregion
 

@@ -57,7 +57,7 @@ struct RawLoginQrRspData(Option<serde_json::Value>);
 pub struct SelfInfoRsp {
   pub code: i32,
   pub message: Option<String>,
-  pub ttl: i32,
+  pub ttl: Option<i32>,
   pub data: SelfInfo,
 }
 
@@ -71,6 +71,20 @@ pub struct SelfInfo {
   #[serde(rename = "uname")]
   pub username: Option<String>,
   // and so on... ignore them
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AlbumUploadRsp {
+  pub code: i32,
+  pub message: Option<String>,
+  pub data: Option<AlbumUploadData>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AlbumUploadData {
+  pub image_url: Option<String>,
+  pub image_width: Option<u32>,
+  pub image_height: Option<u32>,
 }
 
 #[cfg(test)]

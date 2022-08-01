@@ -13,6 +13,7 @@ lto = true
 thiserror = "1.0"
 chrono = "0.4"
 lazy_static = "1.4"
+rand = "0.8.5"
 
 qr2term = "0.3"
 
@@ -34,7 +35,7 @@ reqwest_cookie_store = "0.3.0"
 
 [dependencies.reqwest]
 version = "0.11"
-features = ["json", "cookies", "brotli", "gzip", "deflate"]
+features = ["json", "cookies", "brotli", "gzip", "deflate", "multipart"]
 
 [dependencies.tokio]
 version = "1.20"
