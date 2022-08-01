@@ -1,5 +1,4 @@
 use std::cmp::Ordering;
-use std::error::Error;
 use std::io;
 use std::io::{Cursor, Write};
 
@@ -7,34 +6,16 @@ use png::{BitDepth, ColorType, Compression, DecodingError, EncodingError};
 
 use super::Encoder;
 
-#[allow(dead_code)]
-pub struct PngEncoder {
-  raw_enc: RawPngEnc,
-}
-
-#[allow(dead_code)]
-struct RawPngEnc {
-  name: &'static str,
-}
-
-impl PngEncoder {
-  #[allow(dead_code)]
-  pub fn new() -> PngEncoder {
-    let enc = RawPngEnc {
-      name: "png_encoder",
-    };
-    PngEncoder { raw_enc: enc }
-  }
-}
+pub struct PngEncoder();
 
 impl Encoder for PngEncoder {
   type Error = PngError;
 
-  fn encode(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+  fn encode(&self, data: &[u8]) -> Result<Vec<u8>, Self::Error> {
     let modifier = MIB_MATRIX
       .iter()
       .find(|(size, _)| data.len() == *size)
-      .or(MIB_MATRIX.iter().find(|(size, _)| data.len() <= *size))
+      .or_else(|| MIB_MATRIX.iter().find(|(size, _)| data.len() <= *size))
       .map(|(_, func)| func);
 
     let mut metadata = Metadata::default();
@@ -74,25 +55,23 @@ impl Encoder for PngEncoder {
       let mut enc = png::Encoder::new(&mut cursor, metadata.width, metadata.height);
       enc.set_depth(metadata.bit_depth);
       enc.set_color(metadata.color_type);
-      let mut writer = enc.write_header().map_err(|e| PngError::Encoding(e))?;
-      let mut stream = writer.stream_writer().map_err(|e| PngError::Encoding(e))?;
-      stream.write_all(data).map_err(|e| PngError::Io(e))?;
+      let mut writer = enc.write_header().map_err(PngError::Encoding)?;
+      let mut stream = writer.stream_writer().map_err(PngError::Encoding)?;
+      stream.write_all(data).map_err(PngError::Io)?;
       let to_pad_size = metadata.byte_to_padding(data.len()).unwrap();
       stream
         .write_all(&*vec![0; to_pad_size])
-        .map_err(|e| PngError::Io(e))?;
-      stream.finish().map_err(|e| PngError::Encoding(e))?;
+        .map_err(PngError::Io)?;
+      stream.finish().map_err(PngError::Encoding)?;
     }
     Ok(cursor.into_inner())
   }
 
-  fn decode(&self, data: &[u8], data_len: usize) -> Result<Vec<u8>, Box<dyn Error>> {
+  fn decode(&self, data: &[u8], data_len: usize) -> Result<Vec<u8>, Self::Error> {
     let decoder = png::Decoder::new(data);
-    let mut reader = decoder.read_info().map_err(|e| PngError::Decoding(e))?;
+    let mut reader = decoder.read_info().map_err(PngError::Decoding)?;
     let mut buf = vec![0; reader.output_buffer_size()];
-    let info = reader
-      .next_frame(&mut buf)
-      .map_err(|e| PngError::Decoding(e))?;
+    let info = reader.next_frame(&mut buf).map_err(PngError::Decoding)?;
     if info.buffer_size() < data_len {
       Err(PngError::OutOfBound {
         size: data_len,
@@ -119,19 +98,19 @@ pub enum PngError {
   },
   #[error("Size {size} out of bound {bound}")]
   OutOfBound { size: usize, bound: usize },
-  #[error("An encoding error occurred during png enc/dec")]
+  #[error("An encoding error occurred during png enc/dec {0}")]
   Encoding(
     #[from]
     #[source]
     EncodingError,
   ),
-  #[error("An encoding error occurred during png enc/dec")]
+  #[error("An encoding error occurred during png enc/dec {0}")]
   Decoding(
     #[from]
     #[source]
     DecodingError,
   ),
-  #[error("An I/O error occurred during png enc/dec")]
+  #[error("An I/O error occurred during png enc/dec {0}")]
   Io(
     #[from]
     #[source]
@@ -203,15 +182,47 @@ fn color_type_multiple(color_type: &ColorType) -> u32 {
   }
 }
 
+type MetadataBuilder = fn(&mut Metadata);
+
 // (byte, func)
-const MIB_MATRIX: [(usize, fn(&mut Metadata)); 9] = [
-  (524_288 /* 1024 * 1024 * 0.5 */, |i: &mut Metadata| {
+const MIB_MATRIX: [(usize, MetadataBuilder); 15] = [
+  (32768 /* 16 KiB */, |i: &mut Metadata| {
+    i.width = 64;
+    i.height = 64;
+    i.bit_depth = BitDepth::Eight; // 1 byte
+    i.color_type = ColorType::Rgba; // 4
+  }),
+  (32768 /* 32 KiB */, |i: &mut Metadata| {
+    i.width = 64;
+    i.height = 128;
+    i.bit_depth = BitDepth::Eight; // 1 byte
+    i.color_type = ColorType::Rgba; // 4
+  }),
+  (65536 /* 64 KiB */, |i: &mut Metadata| {
+    i.width = 128;
+    i.height = 128;
+    i.bit_depth = BitDepth::Eight; // 1 byte
+    i.color_type = ColorType::Rgba; // 4
+  }),
+  (131072 /* 128 KiB */, |i: &mut Metadata| {
+    i.width = 128;
+    i.height = 256;
+    i.bit_depth = BitDepth::Eight; // 1 byte
+    i.color_type = ColorType::Rgba; // 4
+  }),
+  (262144 /* 256 KiB */, |i: &mut Metadata| {
+    i.width = 256;
+    i.height = 256;
+    i.bit_depth = BitDepth::Eight; // 1 byte
+    i.color_type = ColorType::Rgba; // 4
+  }),
+  (524_288 /* 512 KiB */, |i: &mut Metadata| {
     i.width = 256;
     i.height = 512;
     i.bit_depth = BitDepth::Eight; // 1 byte
     i.color_type = ColorType::Rgba; // 4
   }),
-  (1024 * 1024 * 1, |i: &mut Metadata| {
+  (1024 * 1024, |i: &mut Metadata| {
     i.width = 512;
     i.height = 512;
     i.bit_depth = BitDepth::Eight; // 1 byte
@@ -259,11 +270,16 @@ const MIB_MATRIX: [(usize, fn(&mut Metadata)); 9] = [
     i.bit_depth = BitDepth::Sixteen; // 2 byte
     i.color_type = ColorType::Rgba; // 4
   }),
+  (1024 * 1024 * 12, |i: &mut Metadata| {
+    i.width = 1024;
+    i.height = 1536;
+    i.bit_depth = BitDepth::Sixteen; // 2 byte
+    i.color_type = ColorType::Rgba; // 4
+  }),
 ];
 
 #[cfg(test)]
 mod tests {
-  use std::io::{Read, Write};
   use std::sync::Mutex;
   use std::thread::{spawn, JoinHandle};
 
@@ -274,8 +290,8 @@ mod tests {
 
   #[test]
   fn encode_png() {
-    let enc = PngEncoder::new();
-    enc.encode(&mut [1, 2, 3, 4]).unwrap();
+    let enc = PngEncoder();
+    enc.encode(&[1, 2, 3, 4]).unwrap();
   }
 
   #[test]
@@ -305,7 +321,7 @@ mod tests {
   fn encode_different_size() {
     const ARR: [usize; 9] = [
       524_288,
-      1024 * 1024 * 1,
+      1024 * 1024,
       1_572_864,
       1024 * 1024 * 2,
       2_621_440,
@@ -319,8 +335,8 @@ mod tests {
 
     ARR.iter().for_each(|i| {
       let thread = spawn(|| {
-        let enc = PngEncoder::new();
-        enc.encode(&mut vec![0; *i]).unwrap();
+        let enc = PngEncoder();
+        enc.encode(&vec![0; *i]).unwrap();
       });
       let mut list = list.lock().unwrap();
       list.push(thread);
@@ -328,8 +344,8 @@ mod tests {
 
     ARR.iter().for_each(|i| {
       let thread = spawn(|| {
-        let enc = PngEncoder::new();
-        enc.encode(&mut vec![0; *i - 1000]).unwrap();
+        let enc = PngEncoder();
+        enc.encode(&vec![0; *i - 1000]).unwrap();
       });
       let mut list = list.lock().unwrap();
       list.push(thread);
