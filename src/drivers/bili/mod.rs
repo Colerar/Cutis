@@ -8,11 +8,11 @@ use cookie_store::CookieStore;
 use rand::seq::SliceRandom;
 use reqwest::header::{ORIGIN, REFERER};
 use reqwest::multipart::{Form, Part};
-use reqwest::{Client, Proxy};
+use reqwest::Client;
 use reqwest_cookie_store::CookieStoreRwLock;
 
 use self::data::AlbumUploadRsp;
-use self::url::{ALBUM_UPLOAD_URL, FEED_DOMAIN, WWW};
+use self::url::{ALBUM_UPLOAD_URL, FEED_DOMAIN};
 
 use self::data::{LoginQrRsp, QrRsp, SelfInfoRsp};
 use self::url::{BASIC_INFO_GET_URL, LOGIN_QRCODE_GET_WEB_URL, LOGIN_WEB_QRCODE_URL};
