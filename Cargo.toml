@@ -3,6 +3,40 @@ name = "cutis"
 version = "0.1.0"
 edition = "2021"
 
+[profile.release]
+incremental = true
+opt-level = 3
+strip = "symbols"
+lto = true
+
 [dependencies]
-png = "0.17"
 thiserror = "1.0"
+chrono = "0.4"
+lazy_static = "1.4"
+
+qr2term = "0.3"
+
+directories = "4.0"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+png = "0.17"
+
+futures = { version = "0.3" }
+async-trait = "0.1"
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+cookie_store = "0.16.1"
+reqwest_cookie_store = "0.3.0"
+
+[dependencies.reqwest]
+version = "0.11"
+features = ["json", "cookies", "brotli", "gzip", "deflate"]
+
+[dependencies.tokio]
+version = "1.20"
+default-features = false
+features = ["rt-multi-thread", "io-util", "io-std", "macros"]
