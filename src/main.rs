@@ -13,6 +13,7 @@ use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::{fmt, EnvFilter, FmtSubscriber};
 
 mod dirs;
+mod drivers;
 mod encoder;
 
 fn main() {
