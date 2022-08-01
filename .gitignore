@@ -4,3 +4,13 @@
 
 ### Cargo ###
 /target
+
+### Cutis ###
+/cutis-work
+
+### Logs ###
+logs
+*.log
+
+### macOS ###
+.DS_Store
