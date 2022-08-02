@@ -11,10 +11,11 @@ use reqwest::multipart::{Form, Part};
 use reqwest::Client;
 use reqwest_cookie_store::CookieStoreRwLock;
 
-use self::data::AlbumUploadRsp;
-use self::url::{ALBUM_UPLOAD_URL, FEED_DOMAIN};
+use crate::drivers::bili::url::ALBUM_UPLOAD_URL;
 
+use self::data::AlbumUploadRsp;
 use self::data::{LoginQrRsp, QrRsp, SelfInfoRsp};
+use self::url::FEED_DOMAIN;
 use self::url::{BASIC_INFO_GET_URL, LOGIN_QRCODE_GET_WEB_URL, LOGIN_WEB_QRCODE_URL};
 
 pub mod data;
@@ -139,7 +140,7 @@ impl BiliClient {
               .unwrap()
               .file_name(*QUOTES.choose(&mut rand::thread_rng()).unwrap()),
           )
-          .text("biz", "new_dyn")
+          .text("biz", "draw")
           .text("category", "daily")
           .text("csrf", self.get_csrf().await?),
       )
