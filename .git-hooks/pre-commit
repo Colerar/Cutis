@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
 
-echo "======== Rustfmt ========"
-
 CHANGED_FILES="$(git --no-pager diff --name-status --no-color --cached | awk '$1 != "D" && $NF ~ /\.rs$/ { print $NF }')"
 
 if [ -z "$CHANGED_FILES" ]; then
@@ -9,14 +7,8 @@ if [ -z "$CHANGED_FILES" ]; then
   exit 0
 fi
 
-echo "Running rustfmt over these files:"
+echo "Running rustfmt checker over these files:"
 echo "$CHANGED_FILES"
-
-diff=".git/unstaged-rustfmt-git-hook.diff"
-git diff --color=never >$diff
-if [ -s $diff ]; then
-  git apply -R $diff
-fi
 
 if ! command -v "cargo" &>/dev/null; then
   echo "cargo could not be found"
@@ -36,6 +28,8 @@ if ! rustfmt $CHANGED_FILES; then
   exit 1
 fi
 
+echo "Running cargo clippy..."
+
 if ! command -v "cargo-clippy" &>/dev/null; then
   echo "cargo-clippy is not installed, you can install it via:"
   echo "rustup component add clippy"
@@ -46,15 +40,3 @@ if ! cargo clippy --all -- -D warnings; then
   echo "Clippy check failed"
   exit 1
 fi
-
-echo "$CHANGED_FILES" | while read -r file; do
-  if [ -f "$file" ]; then
-    git add "$file"
-  fi
-done
-
-if [ -s $diff ]; then
-  git apply --ignore-whitespace $diff
-fi
-rm $diff
-unset diff
