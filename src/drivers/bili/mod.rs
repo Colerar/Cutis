@@ -1,22 +1,29 @@
+use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Read};
+use std::ops::Add;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use std::{fs, io};
 
-use cookie_store::CookieStore;
-use rand::seq::SliceRandom;
+use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
+use cookie::time::OffsetDateTime;
+use cookie_store::{Cookie, CookieDomain, CookieExpiration, CookieStore};
 use reqwest::header::{ORIGIN, REFERER};
 use reqwest::multipart::{Form, Part};
-use reqwest::Client;
+use reqwest::{Client, ClientBuilder, Url};
 use reqwest_cookie_store::CookieStoreRwLock;
+use tokio::time;
+use tokio::time::timeout;
+use tracing::{debug, info, warn};
 
-use crate::drivers::bili::url::ALBUM_UPLOAD_URL;
+use super::bili::url::ALBUM_UPLOAD_URL;
+use super::Driver;
 
-use self::data::AlbumUploadRsp;
-use self::data::{LoginQrRsp, QrRsp, SelfInfoRsp};
-use self::url::FEED_DOMAIN;
-use self::url::{BASIC_INFO_GET_URL, LOGIN_QRCODE_GET_WEB_URL, LOGIN_WEB_QRCODE_URL};
+use self::data::{AlbumUploadRsp, LoginQrRsp, QrRsp, SelfInfoRsp};
+use self::url::{BASIC_INFO_GET_URL, FEED_DOMAIN, LOGIN_QRCODE_GET_WEB_URL, LOGIN_WEB_QRCODE_URL};
 
 pub mod data;
 mod url;
@@ -30,36 +37,8 @@ pub struct BiliClient {
 }
 
 impl BiliClient {
-  async fn new() -> BiliClient {
-    let mut path = crate::dirs::DATA.clone();
-    path.push("./cookies.jsonl");
-    if let Some(parent) = path.parent() {
-      fs::create_dir_all(parent).expect("Failed to create dir");
-    }
-    let file = OpenOptions::new()
-      .create(true)
-      .read(true)
-      .write(true)
-      .open(&path)
-      .unwrap();
-    let cookie_store = {
-      let file = BufReader::new(&file);
-      CookieStore::load_json(file).unwrap()
-    };
-    let cookie_store = CookieStoreRwLock::new(cookie_store);
-    let cookie_store = Arc::new(cookie_store);
-
-    let builder = Client::builder()
-      .pool_max_idle_per_host(0)
-      .cookie_provider(Arc::clone(&cookie_store))
-      .user_agent(MAC_SAFARI_USER_AGENT);
-    let client = builder.build().expect("Failed to create reqwest client");
-
-    BiliClient {
-      reqwest: client,
-      cookie_path: path,
-      cookie: Arc::clone(&cookie_store),
-    }
+  fn reqwest(&self) -> Client {
+    self.reqwest.clone()
   }
 
   async fn get_csrf(&self) -> Result<String, GetCsrfError> {
@@ -86,7 +65,7 @@ impl BiliClient {
   // region ======= Login =======
 
   async fn get_login_qr(&self) -> Result<QrRsp, reqwest::Error> {
-    let result = self.reqwest.get(LOGIN_QRCODE_GET_WEB_URL).send().await?;
+    let result = self.reqwest().get(LOGIN_QRCODE_GET_WEB_URL).send().await?;
     let qr_data: QrRsp = result.json().await?;
     Ok(qr_data)
   }
@@ -98,7 +77,7 @@ impl BiliClient {
       Err(LoginQrError::NoneOauthKey)?
     };
     let result = self
-      .reqwest
+      .reqwest()
       .post(LOGIN_WEB_QRCODE_URL)
       .form(&[("oauthKey", key)])
       .send()
@@ -113,7 +92,9 @@ impl BiliClient {
   // region ======= Info =======
 
   async fn get_self_info(&self) -> Result<SelfInfoRsp, reqwest::Error> {
-    let rsp = self.reqwest.get(BASIC_INFO_GET_URL).send().await?;
+    let builder = self.reqwest().get(BASIC_INFO_GET_URL);
+    dbg!(&builder);
+    let rsp = builder.send().await?;
     let info: SelfInfoRsp = rsp.json().await?;
     Ok(info)
   }
@@ -127,7 +108,7 @@ impl BiliClient {
     init_part: Part,
   ) -> Result<AlbumUploadRsp, AlbumUploadError> {
     let rsp = self
-      .reqwest
+      .reqwest()
       .post(ALBUM_UPLOAD_URL)
       .header(REFERER, FEED_DOMAIN)
       .header(ORIGIN, FEED_DOMAIN)
@@ -138,7 +119,7 @@ impl BiliClient {
             init_part
               .mime_str("image/*")
               .unwrap()
-              .file_name(*QUOTES.choose(&mut rand::thread_rng()).unwrap()),
+              .file_name("B站未来有可能会倒闭，但绝不会变质"),
           )
           .text("biz", "draw")
           .text("category", "daily")
@@ -151,6 +132,164 @@ impl BiliClient {
   }
 
   // endregion ======= Upload ======= //
+}
+
+#[async_trait]
+impl Driver for BiliClient {
+  async fn new() -> Result<Arc<BiliClient>, anyhow::Error> {
+    BiliClient::new_with_options(|i| i).await
+  }
+
+  async fn new_with_options<F>(option: F) -> Result<Arc<Self>, anyhow::Error>
+  where
+    F: FnOnce(ClientBuilder) -> ClientBuilder + Send,
+  {
+    let mut path = crate::dirs::DATA.clone();
+    path.push("./bili_cookies.jsonl");
+    if let Some(parent) = path.parent() {
+      fs::create_dir_all(parent).expect("Failed to create dir");
+    }
+    let file = OpenOptions::new()
+      .create(true)
+      .read(true)
+      .write(true)
+      .open(&path)
+      .unwrap();
+    let cookie_store = {
+      let file = BufReader::new(&file);
+      CookieStore::load_json(file).unwrap()
+    };
+    let cookie_store = CookieStoreRwLock::new(cookie_store);
+    let cookie_store = Arc::new(cookie_store);
+
+    let builder = Client::builder()
+      .pool_max_idle_per_host(0)
+      .cookie_provider(Arc::clone(&cookie_store))
+      .user_agent(MAC_SAFARI_USER_AGENT);
+    let client = option(builder)
+      .build()
+      .expect("Failed to create reqwest client");
+
+    Ok(Arc::new(BiliClient {
+      reqwest: client,
+      cookie_path: path,
+      cookie: Arc::clone(&cookie_store),
+    }))
+  }
+
+  async fn is_login(&self) -> Result<bool, anyhow::Error> {
+    self
+      .get_self_info()
+      .await
+      .map(|a| a.data.is_login)
+      .context("Failed to get is login")
+  }
+
+  async fn log_out(&self) -> Result<(), anyhow::Error> {
+    {
+      let mut cookie = self
+        .cookie
+        .write()
+        .map_err(|_| anyhow::Error::msg("Poisoned RwLock"))?;
+      cookie.clear();
+    }
+    self.save_cookies().await?;
+    Ok(())
+  }
+
+  async fn qr_login(&self) -> Result<(), anyhow::Error> {
+    let qr = self
+      .get_login_qr()
+      .await
+      .context("Failed to get loginqr, network error")?;
+    let url = qr
+      .data
+      .as_ref()
+      .and_then(|qr| qr.url.clone())
+      .context("Failed to get login qr, url is none")?;
+    info!("Please open bilibili app, scan the qrcode below and confirm.");
+    if qr2term::print_qr(url).is_err() {
+      warn!("Failed to send qrcode via terminal");
+      warn!("Please visit the website, then open bilibili app, scan the qrcode and confirm.");
+    }
+    let rsp: Result<(), _> = timeout(Duration::from_secs(120), async {
+      loop {
+        debug!("Try to login in");
+        let login = self.login_qrcode(&qr).await;
+        let success = match login {
+          Ok(login) => login.code == 0,
+          _ => false,
+        };
+        if success {
+          break;
+        }
+        time::sleep(Duration::from_secs(5)).await;
+      }
+    })
+    .await;
+    if rsp.is_err() {
+      return rsp.context("Long time (120 seconds) not login, timed out.");
+    };
+    self.save_cookies().await?;
+    Ok(())
+  }
+
+  async fn cookie_login(&self, cookie: &str) -> Result<(), anyhow::Error> {
+    {
+      let mut store = self
+        .cookie
+        .write()
+        .map_err(|_| anyhow!("Poisoned RwLock"))?;
+      let url = "https://bilibili.com"
+        .parse()
+        .context("Failed to parse cookie domain")?;
+      let raw_cookie = String::from(cookie);
+
+      fn cookie_from_header<'a>(raw_cookie: &str, url: &Url) -> Result<Vec<Cookie<'a>>> {
+        let mut cookies = Vec::new();
+        let string = raw_cookie.replace(' ', "");
+        let vec = string.split(';');
+        for x in vec {
+          let cookie = Cookie::parse(String::from(x), url).context("Failed to parse cookie")?;
+          cookies.push(cookie);
+        }
+        Ok(cookies)
+      }
+
+      let mut cookies = cookie_from_header(&*raw_cookie, &url).context("Unable to parse cookie")?;
+      store.clear();
+      for x in cookies.iter_mut() {
+        let time = OffsetDateTime::now_utc().add(Duration::new(60 * 24 * 60 * 365, 0));
+        x.expires = CookieExpiration::AtUtc(time);
+        x.domain = CookieDomain::Suffix("bilibili.com".to_string());
+        store
+          .insert(x.to_owned(), &url)
+          .with_context(|| format!("Failed to insert cookie {:?}", x))?;
+      }
+    }
+    {
+      self.save_cookies().await?;
+    }
+    Ok(())
+  }
+
+  async fn upload_image(&self, data: Vec<u8>) -> Result<Url, anyhow::Error> {
+    let bytes = data.bytes();
+    debug!("Uploading image, size {}...", bytes.count());
+    let rsp = self.upload_image_via_album(Part::bytes(data)).await?;
+    if rsp.code != 0 {
+      return Err(anyhow!("Response json code != 0: {:#?}", rsp));
+    }
+    if let Some(data) = &rsp.data {
+      if let Some(url) = &data.image_url {
+        Ok(url.parse()?)
+      } else {
+        Err(anyhow!("Url is none {:#?}", &rsp))
+      }
+    } else {
+      Err(anyhow!("Data is none {:#?}", &rsp))
+    }
+  }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -189,17 +328,32 @@ pub enum AlbumUploadError {
 
 #[cfg(test)]
 mod tests {
-  use reqwest::multipart::Part;
+  use std::fs::File;
+  use std::io::{BufReader, Read};
+  use std::sync::Arc;
 
-  use crate::drivers::bili::GetCsrfError;
+  use reqwest::multipart::Part;
+  use tracing::info;
+
   use crate::encoder::Encoder;
+  use crate::init_logger;
 
   use super::BiliClient;
+  use super::Driver;
+  use super::GetCsrfError;
+
+  lazy_static! {
+    static ref TEST_CLI: Arc<BiliClient> = {
+      async fn init() -> Arc<BiliClient> {
+        BiliClient::new().await.unwrap()
+      }
+      futures::executor::block_on(init())
+    };
+  }
 
   #[tokio::test]
   async fn get_csrf_test() {
-    let bili_cli = BiliClient::new().await;
-    match bili_cli.get_csrf().await {
+    match TEST_CLI.get_csrf().await {
       Ok(cookie) => {
         dbg!(cookie);
       }
@@ -212,8 +366,7 @@ mod tests {
 
   #[tokio::test]
   async fn get_login_qr_test() {
-    let bili_cli = BiliClient::new().await;
-    dbg!(bili_cli.get_login_qr().await.unwrap());
+    dbg!(TEST_CLI.get_login_qr().await.unwrap());
   }
 
   #[tokio::test]
@@ -221,18 +374,14 @@ mod tests {
     if option_env!("RUN_MANUALLY") != Some("true") {
       return;
     }
-    let bili_cli = BiliClient::new().await;
-    let rsp = bili_cli.get_login_qr().await.unwrap();
-    qr2term::print_qr(rsp.data.as_ref().unwrap().url.as_ref().unwrap()).unwrap();
-    let resp = bili_cli.login_qrcode(&rsp).await;
-    bili_cli.save_cookies().await.unwrap();
-    dbg!(resp.unwrap());
+    init_logger();
+    TEST_CLI.qr_login().await.unwrap();
+    info!("Login successfully!");
   }
 
   #[tokio::test]
   async fn get_self_info_test() {
-    let bili_cli = BiliClient::new().await;
-    let rsp = bili_cli.get_self_info().await.unwrap();
+    let rsp = TEST_CLI.get_self_info().await.unwrap();
     dbg!(rsp);
   }
 
@@ -247,20 +396,14 @@ mod tests {
       .unwrap();
     dbg!(rsp);
   }
-}
 
-const QUOTES: [&str; 13] = [
-  "叔叔我啊，真的要生气了",
-  "你所热爱的，就是你的生活",
-  "你妈什么时候死啊?",
-  "我没改变B站",
-  "LV4会员每年将免费获得3个月的“大会员”",
-  "LV5会员每年将免费获得6个月的“大会员”",
-  "LV6会员每年将免费获得9个月的“大会员",
-  "B站未来有可能会倒闭，但绝不会变质",
-  "资本把周宇翔变成了鬼",
-  "汉奸是因利益而产生的，和过去或现在无关",
-  "我没改变B站",
-  "2021年准备让b站市值翻几倍?",
-  "诶哟哟，我一般是不看市值，最重要的是用户满意度",
-];
+  #[tokio::test]
+  async fn bili_cookie_login() {
+    if option_env!("RUN_MANUALLY") != Some("true") {
+      return;
+    }
+    let cookie = std::env::var("BILI_COOKIE").unwrap();
+    TEST_CLI.cookie_login(&*cookie).await.unwrap();
+    dbg!(TEST_CLI.get_self_info().await.unwrap());
+  }
+}

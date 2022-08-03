@@ -73,14 +73,14 @@ pub struct SelfInfo {
   // and so on... ignore them
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct AlbumUploadRsp {
   pub code: i32,
   pub message: Option<String>,
   pub data: Option<AlbumUploadData>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct AlbumUploadData {
   pub image_url: Option<String>,
   pub image_width: Option<u32>,
