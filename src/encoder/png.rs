@@ -2,16 +2,18 @@ use std::cmp::Ordering;
 use std::io;
 use std::io::{Cursor, Write};
 
+use async_trait::async_trait;
 use png::{BitDepth, ColorType, Compression, DecodingError, EncodingError};
 
 use super::Encoder;
 
 pub struct PngEncoder();
 
+#[async_trait]
 impl Encoder for PngEncoder {
   type Error = PngError;
 
-  fn encode(&self, data: &[u8]) -> Result<Vec<u8>, Self::Error> {
+  async fn encode(&self, data: &[u8]) -> Result<Vec<u8>, Self::Error> {
     let modifier = MIB_MATRIX
       .iter()
       .find(|(size, _)| data.len() == *size)
@@ -67,7 +69,7 @@ impl Encoder for PngEncoder {
     Ok(cursor.into_inner())
   }
 
-  fn decode(&self, data: &[u8], data_len: usize) -> Result<Vec<u8>, Self::Error> {
+  async fn decode(&self, data: &[u8], data_len: usize) -> Result<Vec<u8>, Self::Error> {
     let decoder = png::Decoder::new(data);
     let mut reader = decoder.read_info().map_err(PngError::Decoding)?;
     let mut buf = vec![0; reader.output_buffer_size()];
@@ -288,14 +290,14 @@ mod tests {
   use crate::encoder::png::{Metadata, PngEncoder};
   use crate::encoder::Encoder;
 
-  #[test]
-  fn encode_png() {
+  #[tokio::test]
+  async fn encode_png() {
     let enc = PngEncoder();
-    enc.encode(&[1, 2, 3, 4]).unwrap();
+    enc.encode(&[1, 2, 3, 4]).await.unwrap();
   }
 
-  #[test]
-  fn to_padding_byte_should_work() {
+  #[tokio::test]
+  async fn to_padding_byte_should_work() {
     let metadata = Metadata {
       width: 10,
       height: 10,
@@ -317,8 +319,8 @@ mod tests {
     assert_eq!(metadata.byte_to_padding(2), None);
   }
 
-  #[test]
-  fn encode_different_size() {
+  #[tokio::test]
+  async fn encode_different_size() {
     const ARR: [usize; 9] = [
       524_288,
       1024 * 1024,
@@ -331,30 +333,30 @@ mod tests {
       1024 * 1024 * 8,
     ];
 
-    let list: Mutex<Vec<JoinHandle<()>>> = Mutex::new(vec![]);
+    let list: Mutex<Vec<_>> = Mutex::new(vec![]);
 
     ARR.iter().for_each(|i| {
-      let thread = spawn(|| {
+      let handle = tokio::spawn(async {
         let enc = PngEncoder();
-        enc.encode(&vec![0; *i]).unwrap();
+        enc.encode(&vec![0; *i]).await.unwrap();
       });
       let mut list = list.lock().unwrap();
-      list.push(thread);
+      list.push(handle);
     });
 
     ARR.iter().for_each(|i| {
-      let thread = spawn(|| {
+      let handle = tokio::spawn(async {
         let enc = PngEncoder();
-        enc.encode(&vec![0; *i - 1000]).unwrap();
+        enc.encode(&vec![0; *i - 1000]).await.unwrap();
       });
       let mut list = list.lock().unwrap();
-      list.push(thread);
+      list.push(handle);
     });
 
     let mut list = list.into_inner().unwrap();
 
     while let Some(cur_thread) = list.pop() {
-      cur_thread.join().unwrap();
+      cur_thread.await.unwrap();
     }
   }
 }
