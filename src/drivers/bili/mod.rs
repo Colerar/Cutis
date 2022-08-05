@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read};
+use std::io::{BufReader, BufWriter};
 use std::ops::Add;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,6 +11,8 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use cookie::time::OffsetDateTime;
 use cookie_store::{Cookie, CookieDomain, CookieExpiration, CookieStore};
+use log::error;
+use regex::Regex;
 use reqwest::header::{ORIGIN, REFERER};
 use reqwest::multipart::{Form, Part};
 use reqwest::{Client, ClientBuilder, Url};
@@ -39,6 +41,47 @@ pub struct BiliClient {
 impl BiliClient {
   fn reqwest(&self) -> Client {
     self.reqwest.clone()
+  }
+
+  pub async fn new() -> Result<BiliClient, anyhow::Error> {
+    BiliClient::new_with_options(|i| i).await
+  }
+
+  pub async fn new_with_options<F>(option: F) -> Result<BiliClient, anyhow::Error>
+  where
+    F: FnOnce(ClientBuilder) -> ClientBuilder + Send,
+  {
+    let mut path = crate::dirs::DATA.clone();
+    path.push("./bili_cookies.jsonl");
+    if let Some(parent) = path.parent() {
+      fs::create_dir_all(parent).expect("Failed to create dir");
+    }
+    let file = OpenOptions::new()
+      .create(true)
+      .read(true)
+      .write(true)
+      .open(&path)
+      .unwrap();
+    let cookie_store = {
+      let file = BufReader::new(&file);
+      CookieStore::load_json(file).unwrap()
+    };
+    let cookie_store = CookieStoreRwLock::new(cookie_store);
+    let cookie_store = Arc::new(cookie_store);
+
+    let builder = Client::builder()
+      .pool_max_idle_per_host(0)
+      .cookie_provider(Arc::clone(&cookie_store))
+      .user_agent(MAC_SAFARI_USER_AGENT);
+    let client = option(builder)
+      .build()
+      .expect("Failed to create reqwest client");
+
+    Ok(BiliClient {
+      reqwest: client,
+      cookie_path: path,
+      cookie: Arc::clone(&cookie_store),
+    })
   }
 
   async fn get_csrf(&self) -> Result<String, GetCsrfError> {
@@ -93,7 +136,6 @@ impl BiliClient {
 
   async fn get_self_info(&self) -> Result<SelfInfoRsp, reqwest::Error> {
     let builder = self.reqwest().get(BASIC_INFO_GET_URL);
-    dbg!(&builder);
     let rsp = builder.send().await?;
     let info: SelfInfoRsp = rsp.json().await?;
     Ok(info)
@@ -136,53 +178,36 @@ impl BiliClient {
 
 #[async_trait]
 impl Driver for BiliClient {
-  async fn new() -> Result<Arc<BiliClient>, anyhow::Error> {
-    BiliClient::new_with_options(|i| i).await
-  }
-
-  async fn new_with_options<F>(option: F) -> Result<Arc<Self>, anyhow::Error>
-  where
-    F: FnOnce(ClientBuilder) -> ClientBuilder + Send,
-  {
-    let mut path = crate::dirs::DATA.clone();
-    path.push("./bili_cookies.jsonl");
-    if let Some(parent) = path.parent() {
-      fs::create_dir_all(parent).expect("Failed to create dir");
-    }
-    let file = OpenOptions::new()
-      .create(true)
-      .read(true)
-      .write(true)
-      .open(&path)
-      .unwrap();
-    let cookie_store = {
-      let file = BufReader::new(&file);
-      CookieStore::load_json(file).unwrap()
-    };
-    let cookie_store = CookieStoreRwLock::new(cookie_store);
-    let cookie_store = Arc::new(cookie_store);
-
-    let builder = Client::builder()
-      .pool_max_idle_per_host(0)
-      .cookie_provider(Arc::clone(&cookie_store))
-      .user_agent(MAC_SAFARI_USER_AGENT);
-    let client = option(builder)
-      .build()
-      .expect("Failed to create reqwest client");
-
-    Ok(Arc::new(BiliClient {
-      reqwest: client,
-      cookie_path: path,
-      cookie: Arc::clone(&cookie_store),
-    }))
-  }
-
   async fn is_login(&self) -> Result<bool, anyhow::Error> {
     self
       .get_self_info()
       .await
       .map(|a| a.data.is_login)
       .context("Failed to get is login")
+  }
+
+  async fn print_self_info(&self) {
+    match self.get_self_info().await {
+      Ok(info) => {
+        if info.data.is_login {
+          info!("Login successfully!");
+          info!(
+            "User: {name}({uid})",
+            name = info.data.username.unwrap_or_else(|| "Unknown".to_string()),
+            uid = info
+              .data
+              .mid
+              .map(|i| i.to_string())
+              .unwrap_or_else(|| "Unknown".to_string()),
+          );
+        } else {
+          error!("Login failed.")
+        }
+      }
+      Err(err) => {
+        error!("Failed to get self info: {}", err)
+      }
+    }
   }
 
   async fn log_out(&self) -> Result<(), anyhow::Error> {
@@ -211,6 +236,7 @@ impl Driver for BiliClient {
     if qr2term::print_qr(url).is_err() {
       warn!("Failed to send qrcode via terminal");
       warn!("Please visit the website, then open bilibili app, scan the qrcode and confirm.");
+      info!("")
     }
     let rsp: Result<(), _> = timeout(Duration::from_secs(120), async {
       loop {
@@ -230,7 +256,14 @@ impl Driver for BiliClient {
     if rsp.is_err() {
       return rsp.context("Long time (120 seconds) not login, timed out.");
     };
-    self.save_cookies().await?;
+    tokio::join!(
+      async {
+        if let Err(err) = self.save_cookies().await {
+          error!("Failed to save cookies: {}", err);
+        }
+      },
+      self.print_self_info(),
+    );
     Ok(())
   }
 
@@ -274,8 +307,7 @@ impl Driver for BiliClient {
   }
 
   async fn upload_image(&self, data: Vec<u8>) -> Result<Url, anyhow::Error> {
-    let bytes = data.bytes();
-    debug!("Uploading image, size {}...", bytes.count());
+    debug!("Uploading image, size {}...", data.len());
     let rsp = self.upload_image_via_album(Part::bytes(data)).await?;
     if rsp.code != 0 {
       return Err(anyhow!("Response json code != 0: {:#?}", rsp));
@@ -290,9 +322,61 @@ impl Driver for BiliClient {
       Err(anyhow!("Data is none {:#?}", &rsp))
     }
   }
+
+  fn check_can_parse(&self, url: &str) -> bool {
+    SHORT_FORM.is_match(url) || LONG_FORM.is_match(url)
+  }
+
+  fn abbr_url(&self, url: &str) -> Option<String> {
+    if let Some(caps) = LONG_FORM.captures(url) {
+      return Some(format!("bili://{}", &caps["hex"]));
+    }
+    None
+  }
+
+  fn un_abbr_url(&self, url: &str) -> Option<String> {
+    if let Some(caps) = SHORT_FORM.captures(url) {
+      return Some(format!(
+        "https://i0.hdslb.com/bfs/album/{}.png",
+        &caps["hex"]
+      ));
+    }
+    None
+  }
+}
+
+// regexes
+lazy_static! {
+  static ref SHORT_FORM: Regex = Regex::new(
+    r#"(?x)
+    ^
+    bili://
+    (?P<hex>
+      [a-f0-9]{40}
+    )
+    $
+    "#
+  )
+  .unwrap();
+  static ref LONG_FORM: Regex = Regex::new(
+    r#"(?x)
+    ^
+    https?://i0\.hdslb\.com/bfs/album/
+    (?P<hex>
+      [a-f0-9]{40}
+    )
+    \.
+    (?P<format>
+      png|jpeg
+    )
+    $
+    "#
+  )
+  .unwrap();
 }
 
 #[derive(Debug, thiserror::Error)]
+#[error("A error occurred during saving cookie")]
 pub enum SaveCookieError {
   #[error("An I/O Error occurred")]
   Io(#[from] io::Error),
@@ -328,8 +412,6 @@ pub enum AlbumUploadError {
 
 #[cfg(test)]
 mod tests {
-  use std::fs::File;
-  use std::io::{BufReader, Read};
   use std::sync::Arc;
 
   use reqwest::multipart::Part;
@@ -345,7 +427,7 @@ mod tests {
   lazy_static! {
     static ref TEST_CLI: Arc<BiliClient> = {
       async fn init() -> Arc<BiliClient> {
-        BiliClient::new().await.unwrap()
+        Arc::new(BiliClient::new().await.unwrap())
       }
       futures::executor::block_on(init())
     };
@@ -374,7 +456,7 @@ mod tests {
     if option_env!("RUN_MANUALLY") != Some("true") {
       return;
     }
-    init_logger();
+    init_logger(None);
     TEST_CLI.qr_login().await.unwrap();
     info!("Login successfully!");
   }
@@ -387,10 +469,9 @@ mod tests {
 
   #[tokio::test]
   async fn upload_image_via_album_test() {
-    let bili_cli = BiliClient::new().await;
     let enc = crate::encoder::png::PngEncoder();
-    let encoded = enc.encode(&[80; 114514]).unwrap();
-    let rsp = bili_cli
+    let encoded = enc.encode(&[80; 114514]).await.unwrap();
+    let rsp = TEST_CLI
       .upload_image_via_album(Part::bytes(encoded))
       .await
       .unwrap();
@@ -405,5 +486,44 @@ mod tests {
     let cookie = std::env::var("BILI_COOKIE").unwrap();
     TEST_CLI.cookie_login(&*cookie).await.unwrap();
     dbg!(TEST_CLI.get_self_info().await.unwrap());
+  }
+
+  #[test]
+  fn check_can_parse_test() {
+    assert!(TEST_CLI.check_can_parse("bili://2569aaaa4f9b28787cf1f0c5b1134cc7e0900000"));
+    assert!(TEST_CLI.check_can_parse(
+      "http://i0.hdslb.com/bfs/album/2569aaaa4f9b28787cf1f0c5b1134cc7e0900000.png"
+    ));
+    assert!(TEST_CLI.check_can_parse(
+      "https://i0.hdslb.com/bfs/album/2569aaaa4f9b28787cf1f0c5b1134cc7e0900000.png"
+    ));
+    assert!(!TEST_CLI.check_can_parse(
+      "https://i0.hdslb.com/bfs/album/2569aaaa4f9b28787cf1f0c5b1134cc7e0900000.webm"
+    ));
+    assert!(!TEST_CLI.check_can_parse(
+      "https://i0.hdslb.com/bfs/album/2569aa4f9b28787cf1f0c5b1134cc7e0900000.webm"
+    ));
+    assert!(!TEST_CLI.check_can_parse("bili://FAILED"));
+    assert!(!TEST_CLI.check_can_parse("bili://2569aaaa4f9b28787cf1f0c5b1134cc7e0900000.png"));
+    assert!(!TEST_CLI.check_can_parse("2569AAaa4f9b28787cf1f0c5b1134cc7e0900000"));
+  }
+
+  #[test]
+  fn abbr_unabbr_url_test() {
+    assert_eq!(
+      TEST_CLI.un_abbr_url("bili://2569aaaa4f9b28787cf1f0c5b1134cc7e0900000"),
+      Some(
+        "https://i0.hdslb.com/bfs/album/2569aaaa4f9b28787cf1f0c5b1134cc7e0900000.png".to_string()
+      ),
+    );
+    assert_eq!(
+      TEST_CLI.un_abbr_url("bili://2569aaaa4f9b28787cf1f0c5b1134cc7e090"),
+      None,
+    );
+    assert_eq!(
+      TEST_CLI
+        .abbr_url("https://i0.hdslb.com/bfs/album/2569aaaa4f9b28787cf1f0c5b1134cc7e0900000.png"),
+      Some("bili://2569aaaa4f9b28787cf1f0c5b1134cc7e0900000".to_string()),
+    );
   }
 }

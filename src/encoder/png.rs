@@ -11,9 +11,7 @@ pub struct PngEncoder();
 
 #[async_trait]
 impl Encoder for PngEncoder {
-  type Error = PngError;
-
-  async fn encode(&self, data: &[u8]) -> Result<Vec<u8>, Self::Error> {
+  async fn encode(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
     let modifier = MIB_MATRIX
       .iter()
       .find(|(size, _)| data.len() == *size)
@@ -69,7 +67,7 @@ impl Encoder for PngEncoder {
     Ok(cursor.into_inner())
   }
 
-  async fn decode(&self, data: &[u8], data_len: usize) -> Result<Vec<u8>, Self::Error> {
+  async fn decode(&self, data: &[u8], data_len: usize) -> anyhow::Result<Vec<u8>> {
     let decoder = png::Decoder::new(data);
     let mut reader = decoder.read_info().map_err(PngError::Decoding)?;
     let mut buf = vec![0; reader.output_buffer_size()];
@@ -188,7 +186,7 @@ type MetadataBuilder = fn(&mut Metadata);
 
 // (byte, func)
 const MIB_MATRIX: [(usize, MetadataBuilder); 15] = [
-  (32768 /* 16 KiB */, |i: &mut Metadata| {
+  (16384 /* 16 KiB */, |i: &mut Metadata| {
     i.width = 64;
     i.height = 64;
     i.bit_depth = BitDepth::Eight; // 1 byte
