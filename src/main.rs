@@ -6,12 +6,14 @@ extern crate lazy_static;
 use std::env;
 #[cfg(debug_assertions)]
 use std::env::set_current_dir;
+use std::fmt::{Display, Formatter};
 #[cfg(debug_assertions)]
 use std::fs::create_dir_all;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::exit;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -26,13 +28,16 @@ use clap::{
 use clap_verbosity_flag::{LogLevel, Verbosity};
 use dialoguer::theme::ColorfulTheme;
 use futures::StreamExt;
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+
 use reqwest::ClientBuilder;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
 use tokio::{join, spawn};
-use tracing::metadata::LevelFilter;
 use tracing::{debug, error, info, warn};
+
+use tracing::metadata::LevelFilter;
 use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::{fmt, FmtSubscriber};
 
@@ -77,8 +82,10 @@ struct Cli {
 #[derive(Subcommand, Debug, Clone)]
 enum Commands {
   /// Upload your files to the driver you selected
+  #[clap(alias = "u", arg_required_else_help(true))]
   Upload(Upload),
   /// Login to driver
+  #[clap(alias = "l")]
   Login(Login),
 }
 
@@ -117,7 +124,7 @@ struct Upload {
     .args(&["cookie", "qrcode"]),
 ))]
 struct Login {
-  /// Login via Cookie, 'prompt' for asking input
+  /// Login via Cookie
   #[clap(short = 'c', long, value_parser)]
   cookie: bool,
   /// Login via scanning QrCode
@@ -134,11 +141,11 @@ enum Drivers {
 }
 
 impl Drivers {
-  async fn spawn_driver_with_options(&self) -> Box<dyn Driver + Sync + Send> {
-    self.spawn_driver(|i| i).await
+  async fn spawn_driver(&self) -> Box<dyn Driver + Sync + Send> {
+    self.spawn_driver_with_options(|i| i).await
   }
 
-  async fn spawn_driver<F>(&self, option: F) -> Box<dyn Driver + Sync + Send>
+  async fn spawn_driver_with_options<F>(&self, option: F) -> Box<dyn Driver + Sync + Send>
   where
     F: FnOnce(ClientBuilder) -> ClientBuilder + Send,
   {
@@ -151,6 +158,12 @@ impl Drivers {
         }
       }
     }
+  }
+}
+
+impl Display for Drivers {
+  fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    f.write_str(self.to_possible_value().unwrap().get_name())
   }
 }
 
@@ -218,18 +231,33 @@ async fn main() {
           exit(exitcode::USAGE);
         }
       }
-      let driver = Arc::new(subcmd.driver.spawn_driver_with_options().await);
+      let driver = Arc::new(subcmd.driver.spawn_driver().await);
+      if driver.upload_need_login() {
+        match driver.is_login().await {
+          Ok(is_login) => {
+            if !is_login {
+              error!("Not login to driver: {}", subcmd.driver);
+              exit(exitcode::USAGE);
+            }
+          }
+          Err(err) => {
+            error!("{err:?}");
+            exit(exitcode::SOFTWARE);
+          }
+        }
+      }
       let mut stream = tokio_stream::iter(subcmd.includes.clone());
       while let Some(path) = stream.next().await {
         let result = upload(Arc::clone(&driver), path.clone(), &subcmd).await;
         if let Err(err) = result {
           error!("Failed to upload file: {}", path.to_string_lossy());
-          error!("{}", err);
+          error!("{err:?}");
         }
       }
     }
     Commands::Login(subcmd) => {
-      let driver = subcmd.driver.spawn_driver_with_options().await;
+      let driver = subcmd.driver.spawn_driver().await;
+      info!("Logging in to driver: {}", subcmd.driver);
       if subcmd.cookie {
         let dialog = dialoguer::Password::with_theme(&ColorfulTheme::default())
           .with_prompt("Your cookie here (input was hidden)")
@@ -241,19 +269,17 @@ async fn main() {
         };
 
         if let Err(err) = driver.cookie_login(&*cookie).await {
-          error!("Failed to login with cookie: {err}");
+          error!("Failed to login with cookie: {err:?}");
         };
 
         driver.print_self_info().await;
       } else if subcmd.qrcode {
         if let Err(err) = driver.qr_login().await {
-          error!("Failed to login with qrcode: {err}");
+          error!("Failed to login with qrcode: {err:?}");
         };
       };
     }
   }
-
-  // upload(BiliClient::new().await.unwrap(), "asdfasdf").await;
 }
 
 #[cfg(debug_assertions)]
@@ -307,8 +333,18 @@ fn init_logger(args: Option<&Cli>) {
 struct FileIndex {
   name: String,
   size: u64,
+  /// Checksum for **the whole raw file**
   b3checksum: String, // blake3 checksum
   blocks: Vec<Block>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct Block {
+  index: u64,
+  size: u64,
+  url: String,
+  /// Checksum for **raw block**, instead of encoded image
+  b3checksum: String,
 }
 
 impl FileIndex {
@@ -352,14 +388,6 @@ impl FileIndex {
   }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-struct Block {
-  index: u64,
-  size: u64,
-  url: String,
-  b3checksum: String,
-}
-
 async fn upload(
   driver: Arc<Box<dyn Driver + Send + Sync + 'static>>,
   path: PathBuf,
@@ -390,28 +418,76 @@ async fn upload(
   let hasher = Arc::new(std::sync::RwLock::new(Hasher::new()));
   let mut buf_reader = BufReader::new(file);
 
-  let mut index = 0;
-
   let (tx, mut rx) = mpsc::channel(max_conc as usize);
 
+  let mp = MultiProgress::new();
+
+  let tick_chars = "⠁⠂⠄⡀⢀⠠⠐⠈ ";
+  let progress_chars = "#>-";
+  let upload_sty = ProgressStyle::with_template(
+    "{spinner} {elapsed_precise:.dim} [{bar:35.cyan/blue}] {pos:>7}/{len:7} {msg}",
+  )
+  .unwrap()
+  .tick_chars(tick_chars)
+  .progress_chars(progress_chars);
+  let disk_sty = ProgressStyle::with_template(
+    "{spinner} {elapsed_precise:.dim} [{bar:35.cyan/blue}] {bytes:^15} {msg}",
+  )
+  .unwrap()
+  .tick_chars(tick_chars)
+  .progress_chars(progress_chars);
+
+  let duration = core::time::Duration::from_millis(500);
+  let diskp = ProgressBar::new(file_meta.len());
+  let block_total = (file_meta.len() as f64 / block_size as f64).ceil() as u64;
+  let encodep = ProgressBar::new(block_total);
+  let uploadp = ProgressBar::new(block_total);
+
+  if tracing::enabled!(tracing::Level::DEBUG) {
+    mp.set_draw_target(ProgressDrawTarget::hidden());
+  };
+
+  mp.add(diskp.clone());
+  mp.add(encodep.clone());
+  mp.add(uploadp.clone());
+
+  diskp.set_style(disk_sty);
+  diskp.enable_steady_tick(duration);
+  uploadp.set_style(upload_sty.clone());
+  uploadp.enable_steady_tick(duration);
+  encodep.set_style(upload_sty);
+  encodep.enable_steady_tick(duration);
+
+  mp.is_hidden();
+
   let blocks = Arc::new(RwLock::new(Vec::new()));
+
+  let mut index = 0;
+  let encoded_num = Arc::new(AtomicUsize::new(0));
+
   {
     let sender = async {
       loop {
+        diskp.set_message(format!("Reading block {index}..."));
         let mut block = vec![0; block_size as usize];
+        diskp.inc(block.len() as u64);
         match buf_reader.read(&mut block) {
           Ok(0) => {
-            info!("Reaches the end of file");
+            diskp.clone().finish_with_message("Complete reading file");
+            debug!("Reaches the end of file");
             drop(tx);
             debug!("Tx dropped");
             break;
           }
           Ok(n) => {
-            info!("Uploading block {index:0>4}");
+            debug!("Uploading block {index:0>4}");
             let driver = Arc::clone(&driver);
             let blocks = Arc::clone(&blocks);
             let hasher = Arc::clone(&hasher);
+            let encodep = encodep.clone();
+            let uploadp = uploadp.clone();
             let path = Arc::clone(&path);
+            let encoded_num = Arc::clone(&encoded_num);
 
             let to_upload = {
               let block = &block[..n];
@@ -439,11 +515,18 @@ async fn upload(
                 })
                 .unwrap();
               drop(to_upload);
+              let encoded = bytes::Bytes::from(encoded);
+              encoded_num.fetch_add(1, Ordering::AcqRel);
+              encodep.inc(1);
+              encodep.set_message(format!("Encoded block {index}..."));
+              if encoded_num.load(Ordering::Acquire) as u64 >= block_total {
+                encodep.finish_with_message("Complete encoding");
+              }
               let try_upload = || async {
                 let url = driver.upload_image(encoded.clone()).await;
-                let url = url.with_context(|| format!("Failed to upload block {index:0>4}"))?;
+                let url = url.with_context(|| format!("Failed to upload block {index}"))?;
                 let ok: Result<Block> = Ok(Block {
-                  index,
+                  index: index as u64,
                   size: n as u64,
                   b3checksum: block_checksum.to_string(),
                   url: url.to_string(),
@@ -455,19 +538,21 @@ async fn upload(
               while retry_times <= max_retry {
                 match try_upload().await {
                   Ok(block) => {
-                    info!("Successfully uploaded block {index:0>4}: {}", block.url);
+                    debug!("Successfully uploaded block {index:0>4}: {}", block.url);
                     debug!("{block:#?}");
+                    uploadp.inc(1);
+                    uploadp.set_message(format!("Uploaded block {index}..."));
                     let mut blocks = blocks.write().await;
                     blocks.push(block);
                     break;
                   }
                   Err(err) => {
-                    retry_times += 1;
                     error!(
                       "Failed to upload, retry times: {retry_times} in {}",
                       retry_interval.to_string()
                     );
-                    error!("{}", err.to_string())
+                    error!("{err:?}");
+                    retry_times += 1;
                   }
                 };
               }
@@ -490,6 +575,8 @@ async fn upload(
     };
 
     join!(sender, receiver);
+
+    uploadp.finish_with_message("Complete uploading");
   };
 
   let file_checksum = {
@@ -518,6 +605,7 @@ async fn upload(
       .encode_to_image(&PngEncoder())
       .await
       .context("Failed to encode FileIndex to image")?;
+    let file_index_img = bytes::Bytes::from(file_index_img);
     let mut retry = 1;
     while retry <= max_retry {
       match driver.upload_image(file_index_img.clone()).await {

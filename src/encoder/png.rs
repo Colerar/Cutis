@@ -281,7 +281,6 @@ const MIB_MATRIX: [(usize, MetadataBuilder); 15] = [
 #[cfg(test)]
 mod tests {
   use std::sync::Mutex;
-  use std::thread::{spawn, JoinHandle};
 
   use png::{BitDepth, ColorType, Compression};
 

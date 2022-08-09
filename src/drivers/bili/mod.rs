@@ -9,6 +9,7 @@ use std::{fs, io};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use bytes::Bytes;
 use cookie::time::OffsetDateTime;
 use cookie_store::{Cookie, CookieDomain, CookieExpiration, CookieStore};
 use log::error;
@@ -178,6 +179,14 @@ impl BiliClient {
 
 #[async_trait]
 impl Driver for BiliClient {
+  fn upload_need_login(&self) -> bool {
+    true
+  }
+
+  fn download_need_login(&self) -> bool {
+    false
+  }
+
   async fn is_login(&self) -> Result<bool, anyhow::Error> {
     self
       .get_self_info()
@@ -205,7 +214,7 @@ impl Driver for BiliClient {
         }
       }
       Err(err) => {
-        error!("Failed to get self info: {}", err)
+        error!("Failed to get self info: {err:?}")
       }
     }
   }
@@ -259,7 +268,7 @@ impl Driver for BiliClient {
     tokio::join!(
       async {
         if let Err(err) = self.save_cookies().await {
-          error!("Failed to save cookies: {}", err);
+          error!("Failed to save cookies: {err:?}");
         }
       },
       self.print_self_info(),
@@ -306,9 +315,9 @@ impl Driver for BiliClient {
     Ok(())
   }
 
-  async fn upload_image(&self, data: Vec<u8>) -> Result<Url, anyhow::Error> {
+  async fn upload_image(&self, data: Bytes) -> Result<Url, anyhow::Error> {
     debug!("Uploading image, size {}...", data.len());
-    let rsp = self.upload_image_via_album(Part::bytes(data)).await?;
+    let rsp = self.upload_image_via_album(Part::stream(data)).await?;
     if rsp.code != 0 {
       return Err(anyhow!("Response json code != 0: {:#?}", rsp));
     }

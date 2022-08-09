@@ -1,17 +1,20 @@
 use async_trait::async_trait;
+use bytes::Bytes;
 use reqwest::Url;
 
 pub mod bili;
 
 #[async_trait]
 pub trait Driver: Send + Sync {
+  fn upload_need_login(&self) -> bool;
+  fn download_need_login(&self) -> bool;
   async fn is_login(&self) -> anyhow::Result<bool>;
   async fn print_self_info(&self);
   async fn log_out(&self) -> anyhow::Result<()>;
   async fn qr_login(&self) -> anyhow::Result<()>;
   async fn cookie_login(&self, cookie: &str) -> anyhow::Result<()>;
 
-  async fn upload_image(&self, data: Vec<u8>) -> anyhow::Result<Url>;
+  async fn upload_image(&self, data: Bytes) -> anyhow::Result<Url>;
   // async fn download_image(&self, url: Url) -> anyhow::Result<Vec<u8>> {
   //   let bytes = reqwest::get(url).await?.bytes().await?;
   //   anyhow::Ok(Vec::from(bytes))
